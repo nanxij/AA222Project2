@@ -1,182 +1,165 @@
-#
-# File: project2.py
-#
-
-## top-level submission file
-
 import numpy as np
 
-# base optimize function
 def optimize(f, g, c, x0, n, count, prob):
-    
-    if prob in ("simple1", "simple2", "simple3"):
-        return augmented_lagrangian(f, g, c, x0, n, count)
+    if prob == "simple1":
+        return augmented_lagrangian(f, g, c, x0, n, count, rho=1.0, gamma=2.0, refresh_jacobian=True)
+    elif prob == "simple2":
+        return augmented_lagrangian(f, g, c, x0, n, count, rho=1.0, gamma=2.0, refresh_jacobian=False)
+    elif prob == "simple3":
+        return augmented_lagrangian(f, g, c, x0, n, count, rho=1.0, gamma=2.0, refresh_jacobian=True)
     else:
-        # Secret problems: higher-dimensional, more evaluations available.
-        # AL is robust; use it with a longer inner loop.
-        return augmented_lagrangian(f, g, c, x0, n, count, inner_iters=200)
-    
-# method 1  
-def augmented_lagrangian(f, g, c, x0, n, count,
-                         rho=1.0, gamma=5.0, inner_iters=100):
+        return augmented_lagrangian(f, g, c, x0, n, count, rho=1.0, gamma=2.0, refresh_jacobian=True)
+
+
+def augmented_lagrangian(f, g, c, x0, n, count, rho=1.0, gamma=2.0, refresh_jacobian=False):
     x = x0.copy().astype(float)
-    lam = np.zeros(len(c(x)))   # Lagrange multipliers (one per constraint)
- 
+    cx = c(x).flatten()
+    lam = np.zeros(len(cx))
+
     x_best = x.copy()
     f_best = np.inf
     feasible_best = False
- 
-    while count() < n:
-        # --- Define augmented Lagrangian and its gradient ---
-        def aug_obj(x):
-            cx = c(x)
-            shifted = lam / rho + cx
-            penalty = (rho / 2.0) * np.sum(np.maximum(0.0, shifted) ** 2)
-            return f(x) + penalty
- 
-        def aug_grad(x):
-            cx = c(x)
-            shifted = lam / rho + cx
-            active = (shifted > 0).astype(float)
-            # gradient of penalty w.r.t. x: rho * max(0, shifted) * grad_c_i(x)
-            # We approximate grad_c via finite differences (as required by rules)
-            gx = g(x)  # gradient of f (costs 2 evals)
-            grad_penalty = finite_diff_constraint_grad(c, x, cx, active, count, n)
-            return gx + grad_penalty
- 
-        # --- Inner loop: gradient descent with backtracking line search ---
-        x = gradient_descent(aug_obj, aug_grad, x, inner_iters, count, n)
- 
-        # --- Track best feasible point ---
-        cx = c(x)
-        is_feasible = np.all(cx <= 0)
-        fx = f(x)
- 
-        if is_feasible:
-            if not feasible_best or fx < f_best:
-                x_best = x.copy()
-                f_best = fx
-                feasible_best = True
-        elif not feasible_best:
-            # No feasible point yet; track least-infeasible
-            viol = np.sum(np.maximum(0, cx))
-            if viol < f_best:
-                x_best = x.copy()
-                f_best = viol
- 
-        # --- Update multipliers and penalty ---
+
+    # Choose inner iters based on refresh jacob
+    inner_iters = 5 if refresh_jacobian else 8
+
+    while count() < n - 20:
+        cx = c(x).flatten()
+
+        # Compute J
+        if not refresh_jacobian:
+            J = _jacobian(c, x, cx, count, n)
+
+        for _ in range(inner_iters):
+            if count() >= n - 12:
+                break
+
+            cx_i = c(x).flatten()
+
+            # Refresh J if requested
+            if refresh_jacobian:
+                if count() >= n - 12:
+                    break
+                J = _jacobian(c, x, cx_i, count, n)
+
+            shifted = lam / rho + cx_i
+            active = np.maximum(0.0, shifted)
+
+            gx = g(x)
+            grad = gx + rho * (J.T @ active)
+
+            gnorm = np.linalg.norm(grad)
+            if not np.isfinite(gnorm) or gnorm < 1e-8:
+                break
+
+            step = 1.0 / gnorm
+            fx_aug = f(x) + (rho / 2.0) * np.sum(active ** 2)
+
+            x_new = x - step * grad
+            for _ in range(8):
+                if count() >= n - 5:
+                    break
+                x_cand = x - step * grad
+                cx_cand = c(x_cand).flatten()
+                a_cand = np.maximum(0.0, lam / rho + cx_cand)
+                fx_cand = f(x_cand) + (rho / 2.0) * np.sum(a_cand ** 2)
+                if np.isfinite(fx_cand) and fx_cand <= fx_aug - 1e-4 * step * gnorm ** 2:
+                    x_new = x_cand
+                    break
+                step *= 0.5
+
+            if not np.all(np.isfinite(x_new)):
+                break
+            x = x_new
+
+        # Track best
+        if count() < n:
+            cx = c(x).flatten()
+        if count() < n:
+            fx = f(x)
+            if np.all(cx <= 0):
+                if not feasible_best or fx < f_best:
+                    x_best, f_best, feasible_best = x.copy(), fx, True
+            elif not feasible_best:
+                viol = np.sum(np.maximum(0.0, cx))
+                if viol < f_best:
+                    x_best, f_best = x.copy(), viol
+
         lam = np.maximum(0.0, lam + rho * cx)
-        rho = min(rho * gamma, 1e8)
- 
-        if count() >= n:
-            break
- 
+        rho = min(rho * gamma, 1e4)
+
     return x_best
 
-# helpers 
-def finite_diff_constraint_grad(c, x, cx, active_mask, count, n, eps=1e-5):
-    """
-    Finite difference gradient of sum_i active_i * rho * max(0, shifted_i) * c_i(x).
-    Since rho and lam are captured in active_mask * shifted already, we just need:
-        d/dx [ sum_i active_i * c_i(x) ]
-    which is the Jacobian of c at x, weighted by active_mask.
-    We use forward differences column by column.
-    """
-    if not np.any(active_mask):
-        return np.zeros_like(x)
- 
-    grad = np.zeros_like(x)
+
+def _jacobian(c, x, cx, count, n, eps=1e-5):
+    cx = np.atleast_1d(cx).flatten()
+    J = np.zeros((len(cx), len(x)))
     for j in range(len(x)):
-        if count() + 1 > n:
+        if count() >= n - 10:
             break
         xp = x.copy()
         xp[j] += eps
-        cxp = c(xp)
-        # weighted sum of constraint changes in active directions
-        grad[j] = np.dot(active_mask, (cxp - cx)) / eps
-    return grad
- 
-def gradient_descent(obj, grad, x, max_iters, count, n,
-                     alpha=1.0, beta=0.5, c_armijo=1e-4):
-    """
-    Gradient descent with backtracking line search (Armijo condition).
-    Stops when budget is exhausted or gradient is near zero.
-    """
-    x = x.copy()
-    for _ in range(max_iters):
-        if count() >= n:
-            break
-        gx = grad(x)
-        if np.linalg.norm(gx) < 1e-8:
-            break
- 
-        # Backtracking line search
-        fx = obj(x)
-        step = alpha
-        for _ in range(30):
-            if count() >= n:
-                break
-            x_new = x - step * gx
-            if obj(x_new) <= fx - c_armijo * step * np.dot(gx, gx):
-                break
-            step *= beta
-        else:
-            x_new = x - step * gx
- 
-        x = x_new
- 
-    return x
+        J[:, j] = (np.atleast_1d(c(xp)).flatten() - cx) / eps
+    return J
 
-# method 2
+#algo 2
 
-def quadratic_penalty(f, g, c, x0, n, count,
-                      rho=1.0, gamma=10.0, inner_iters=100):
-    """
-    Quadratic penalty method for inequality constraints c(x) <= 0.
- 
-    Penalized objective:
-        f_pen(x) = f(x) + rho * sum_i max(0, c_i(x))^2
- 
-    Increases rho geometrically each outer iteration.
-    Inner minimization uses gradient descent with backtracking line search.
-    """
+def quadratic_penalty(f, g, c, x0, n, count, rho=1.0, gamma=3.0):
     x = x0.copy().astype(float)
     x_best = x.copy()
     f_best = np.inf
     feasible_best = False
- 
-    while count() < n:
-        def pen_obj(x):
-            cx = c(x)
-            return f(x) + rho * np.sum(np.maximum(0.0, cx) ** 2)
- 
-        def pen_grad(x):
-            cx = c(x)
+
+    while count() < n - 20:
+        cx = c(x).flatten()
+        J = _jacobian(c, x, cx, count, n)
+
+        for _ in range(8):
+            if count() >= n - 10:
+                break
+
+            cx_i = c(x).flatten()
+            active = np.maximum(0.0, cx_i)
+
             gx = g(x)
-            active = (cx > 0).astype(float)
-            grad_penalty = finite_diff_constraint_grad(c, x, cx, 2 * rho * np.maximum(0, cx), count, n)
-            return gx + grad_penalty
- 
-        x = gradient_descent(pen_obj, pen_grad, x, inner_iters, count, n)
- 
-        cx = c(x)
-        is_feasible = np.all(cx <= 0)
-        fx = f(x)
- 
-        if is_feasible:
-            if not feasible_best or fx < f_best:
-                x_best = x.copy()
-                f_best = fx
-                feasible_best = True
-        elif not feasible_best:
-            viol = np.sum(np.maximum(0, cx))
-            if viol < f_best:
-                x_best = x.copy()
-                f_best = viol
- 
-        rho = min(rho * gamma, 1e8)
- 
-        if count() >= n:
-            break
- 
+            grad = gx + 2.0 * rho * (J.T @ active)
+
+            gnorm = np.linalg.norm(grad)
+            if not np.isfinite(gnorm) or gnorm < 1e-8:
+                break
+
+            step = 1.0 / gnorm
+            fx_pen = f(x) + rho * np.sum(active ** 2)
+
+            x_new = x - step * grad
+            for _ in range(8):
+                if count() >= n - 5:
+                    break
+                x_cand = x - step * grad
+                cx_cand = c(x_cand).flatten()
+                a_cand = np.maximum(0.0, cx_cand)
+                fx_cand = f(x_cand) + rho * np.sum(a_cand ** 2)
+                if np.isfinite(fx_cand) and fx_cand <= fx_pen - 1e-4 * step * gnorm ** 2:
+                    x_new = x_cand
+                    break
+                step *= 0.5
+
+            if not np.all(np.isfinite(x_new)):
+                break
+            x = x_new
+
+        if count() < n:
+            cx = c(x).flatten()
+        if count() < n:
+            fx = f(x)
+            if np.all(cx <= 0):
+                if not feasible_best or fx < f_best:
+                    x_best, f_best, feasible_best = x.copy(), fx, True
+            elif not feasible_best:
+                viol = np.sum(np.maximum(0.0, cx))
+                if viol < f_best:
+                    x_best, f_best = x.copy(), viol
+
+        rho = min(rho * gamma, 1e4)
+
     return x_best
